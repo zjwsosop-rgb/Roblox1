@@ -1,2 +1,3 @@
 # Roblox1
-脚本分享
+Script Sharing
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gumanba/Scripts/main/ClimbWaterslideandSlide"))()
