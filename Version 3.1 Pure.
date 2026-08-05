@@ -1,4 +1,4 @@
--- [[ 版本 V3.1 - 纯净完美版 ]]
+--[[ 版本 V3.1 - 纯净完美版 ]]
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
