@@ -1,0 +1,420 @@
+-- [[ 版本 V3.1 - 悬浮球完美交互修复版 ]]
+-- 1. 彻底摒弃内部冲突按钮，用滑动手势距离判定代替。
+-- 2. 修复最小化后悬浮球无法拖拽的Bug，现在可以任意抓取移动。
+-- 3. 拖拽后松开手指，圆球会停在松开的位置；轻触即松则是恢复窗口。
+
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local StarterGui = game:GetService("StarterGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local LocalPlayer = Players.LocalPlayer
+
+local colorPresets = {
+	{winBg=Color3.fromRGB(20, 22, 28), titleBg=Color3.fromRGB(30, 32, 40), accent=Color3.fromRGB(60, 120, 255)},
+	{winBg=Color3.fromRGB(25, 18, 18), titleBg=Color3.fromRGB(40, 25, 25), accent=Color3.fromRGB(255, 80, 80)},
+	{winBg=Color3.fromRGB(16, 22, 20), titleBg=Color3.fromRGB(25, 40, 30), accent=Color3.fromRGB(80, 220, 100)},
+}
+local currentColorIndex = 1
+local isMin = false
+local isTransparent = false
+local isAFKEnabled = false
+local isRainbowStroke = false
+local lastInputTime = tick()
+local currentSelectedPlayer = nil
+local playedIdSet = {}
+local dropdownOpen = false
+local floatRainbowThread = nil
+local floatFrame = nil
+local isDraggingFloat = false
+local floatTouchStart, floatFrameStart
+
+local function notify(msg)
+	task.spawn(function()
+		pcall(function()
+			StarterGui:SetCore("SendNotification",{Title="系统通知", Text=msg, Duration=1.2})
+		end)
+	end)
+end
+
+local function getExecutorName()
+	local executor = "标准"
+	local success, name = pcall(function() return getexecutorname() end)
+	if success and name then executor = name end
+	return executor
+end
+local execName = getExecutorName()
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "XiaoLu_V3_Stable"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = LocalPlayer.PlayerGui
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 440, 0, 350)
+MainFrame.Position = UDim2.new(0.1, 0, 0.1, 0)
+MainFrame.BackgroundColor3 = colorPresets[currentColorIndex].winBg
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.ZIndex = 100
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner"); MainCorner.CornerRadius = UDim.new(0, 12); MainCorner.Parent = MainFrame
+local UIStroke = Instance.new("UIStroke"); UIStroke.Color = Color3.fromRGB(45, 50, 65); UIStroke.Thickness = 1.5; UIStroke.Parent = MainFrame
+
+-- ======================== 标题栏 ========================
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, 0, 0, 36)
+TitleBar.BackgroundColor3 = colorPresets[currentColorIndex].titleBg
+TitleBar.BackgroundTransparency = 0.1
+TitleBar.BorderSizePixel = 0
+TitleBar.ZIndex = 200
+TitleBar.Parent = MainFrame
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size = UDim2.new(0.6, 0, 1, 0)
+TitleText.Position = UDim2.new(0, 12, 0, 0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text = "🎵 小路TVT定制 AI版 V3.1"
+TitleText.TextColor3 = Color3.fromRGB(255,255,255)
+TitleText.Font = Enum.Font.GothamBold
+TitleText.TextSize = 12
+TitleText.TextXAlignment = Enum.TextXAlignment.Left
+TitleText.Parent = TitleBar
+
+-- 变色按钮
+local ColorBtn = Instance.new("TextButton")
+ColorBtn.Size = UDim2.new(0, 32, 0, 28)
+ColorBtn.Position = UDim2.new(1, -80, 0.5, 0)
+ColorBtn.AnchorPoint = Vector2.new(0, 0.5)
+ColorBtn.BackgroundColor3 = colorPresets[currentColorIndex].accent
+ColorBtn.Text = "🎨"
+ColorBtn.TextColor3 = Color3.new(1,1,1)
+ColorBtn.Font = Enum.Font.GothamBold
+ColorBtn.TextSize = 14
+ColorBtn.Parent = TitleBar
+local cCorner = Instance.new("UICorner"); cCorner.CornerRadius = UDim.new(0, 6); cCorner.Parent = ColorBtn
+ColorBtn.MouseButton1Click:Connect(function()
+	currentColorIndex = currentColorIndex + 1
+	if currentColorIndex > #colorPresets then currentColorIndex = 1 end
+	local cfg = colorPresets[currentColorIndex]
+	MainFrame.BackgroundColor3 = cfg.winBg
+	TitleBar.BackgroundColor3 = cfg.titleBg
+	ColorBtn.BackgroundColor3 = cfg.accent
+	notify("已切换配色 "..currentColorIndex)
+end)
+
+-- 最小化按钮
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.new(0, 32, 0, 28)
+MinBtn.Position = UDim2.new(1, -8, 0.5, 0)
+MinBtn.AnchorPoint = Vector2.new(1, 0.5)
+MinBtn.BackgroundColor3 = Color3.fromRGB(50, 55, 65)
+MinBtn.Text = "—"
+MinBtn.TextColor3 = Color3.new(1,1,1)
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 16
+MinBtn.Parent = TitleBar
+local mCorner = Instance.new("UICorner"); mCorner.CornerRadius = UDim.new(0, 6); mCorner.Parent = MinBtn
+
+
+-- ======================== 全新最小化：圆球拖拽 + 点击恢复（统一手势） ========================
+local function createMinFloat(pos)
+	if floatFrame then floatFrame:Destroy(); floatFrame = nil end
+	if floatRainbowThread then task.cancel(floatRainbowThread); floatRainbowThread = nil end
+
+	local ball = Instance.new("Frame")
+	ball.Size = UDim2.new(0, 50, 0, 50)
+	ball.Position = pos or UDim2.new(0.1, 0, 0.1, 0)
+	ball.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+	ball.ZIndex = 10000
+	ball.Parent = ScreenGui
+	local bCorner = Instance.new("UICorner"); bCorner.CornerRadius = UDim.new(1, 0); bCorner.Parent = ball
+	
+	local bStroke = Instance.new("UIStroke"); bStroke.Color = Color3.fromRGB(0, 0, 0); bStroke.Thickness = 2; bStroke.Parent = ball
+	local tText = Instance.new("TextLabel"); tText.Size = UDim2.new(1,0,0.6,0); tText.Position = UDim2.new(0,0,0,2); tText.BackgroundTransparency = 1; tText.Text = "tox"; tText.TextColor3 = Color3.fromRGB(255,255,255); tText.Font = Enum.Font.GothamBlack; tText.TextScaled = true; tText.Parent = ball
+	local wText = Instance.new("TextLabel"); wText.Size = UDim2.new(1,0,0.2,0); wText.Position = UDim2.new(0,0,0.65,0); wText.BackgroundTransparency = 1; wText.Text = "小路TVT"; wText.TextColor3 = Color3.fromRGB(180, 180, 180); wText.Font = Enum.Font.GothamBold; wText.TextSize = 6; wText.Parent = ball
+
+	-- ====== 绝对稳定的手势判定逻辑 ======
+	local isTouching = false
+	local isClickAction = false
+	local touchStartPos = nil
+	local frameStartPos = nil
+
+	ball.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isTouching = true
+			isClickAction = true
+			touchStartPos = Vector2.new(input.Position.X, input.Position.Y)
+			frameStartPos = Vector2.new(ball.Position.X.Offset, ball.Position.Y.Offset)
+		end
+	end)
+
+	ball.InputChanged:Connect(function(input)
+		if isTouching and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local dx = input.Position.X - touchStartPos.X
+			local dy = input.Position.Y - touchStartPos.Y
+			-- 如果手指滑动距离超过 12 像素，取消“点击”判定，执行“拖拽”
+			if (dx*dx + dy*dy) > 144 then
+				isClickAction = false 
+			end
+			ball.Position = UDim2.new(0, frameStartPos.X + dx, 0, frameStartPos.Y + dy)
+		end
+	end)
+
+	ball.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isTouching = false
+			if isClickAction then
+				-- 触发恢复窗口
+				if floatRainbowThread then task.cancel(floatRainbowThread); floatRainbowThread = nil end
+				local restorePos = ball.Position
+				ball:Destroy()
+				floatFrame = nil
+				
+				MainFrame.Position = restorePos
+				MainFrame.Visible = true
+				isMin = false
+			end
+		end
+	end)
+
+	floatFrame = ball
+	return ball
+end
+
+MinBtn.MouseButton1Click:Connect(function()
+	if isMin then return end
+	isMin = true
+	local currentPos = MainFrame.Position
+	MainFrame.Visible = false
+	
+	local ball = createMinFloat(currentPos)
+	floatRainbowThread = task.spawn(function()
+		local h = 0
+		while ball and ball.Parent do
+			h = (h + 0.01) % 1
+			ball.BackgroundColor3 = Color3.fromHSV(h, 1, 0.8)
+			task.wait(0.05)
+		end
+	end)
+end)
+
+
+-- ======================== 用户卡片与执行器 ========================
+local UserCard = Instance.new("Frame"); UserCard.Size = UDim2.new(1, -20, 0, 75); UserCard.Position = UDim2.new(0, 10, 0, 46); UserCard.BackgroundColor3 = Color3.fromRGB(30, 32, 40); UserCard.ZIndex = 50; UserCard.Parent = MainFrame
+local cardCorner = Instance.new("UICorner"); cardCorner.CornerRadius = UDim.new(0, 8); cardCorner.Parent = UserCard
+
+local UserAvatar = Instance.new("ImageLabel"); UserAvatar.Size = UDim2.new(0, 44, 0, 44); UserAvatar.Position = UDim2.new(0, 12, 0.5, 0); UserAvatar.AnchorPoint = Vector2.new(0, 0.5); UserAvatar.BackgroundColor3 = Color3.fromRGB(50,50,50); UserAvatar.ScaleType = Enum.ScaleType.Fit; UserAvatar.Parent = UserCard
+local avCorner = Instance.new("UICorner"); avCorner.CornerRadius = UDim.new(1,0); avCorner.Parent = UserAvatar
+local function updateAvatar()
+	local playerList = Players:GetPlayers(); local targetPlayer = nil
+	for _, p in ipairs(playerList) do if p ~= LocalPlayer then targetPlayer = p; break end end
+	if not targetPlayer then targetPlayer = LocalPlayer end
+	UserAvatar.Image = "rbxthumb://type=Avatar&id="..targetPlayer.UserId.."&w=150&h=150"
+end updateAvatar()
+
+local NameLabel = Instance.new("TextLabel"); NameLabel.Size = UDim2.new(0.6,0,0,20); NameLabel.Position = UDim2.new(0,65,0,8); NameLabel.BackgroundTransparency = 1; NameLabel.Text = "👤 当前用户: 匿名用户"; NameLabel.TextColor3 = Color3.fromRGB(220,220,230); NameLabel.Font = Enum.Font.GothamBold; NameLabel.TextSize = 12; NameLabel.TextXAlignment = Enum.TextXAlignment.Left; NameLabel.Parent = UserCard
+local ExecutorLabel = Instance.new("TextLabel"); ExecutorLabel.Size = UDim2.new(0.6,0,0,15); ExecutorLabel.Position = UDim2.new(0,65,0,30); ExecutorLabel.BackgroundTransparency = 1; ExecutorLabel.Text = "⚙️ 执行器: " .. execName; ExecutorLabel.TextColor3 = Color3.fromRGB(180,180,190); ExecutorLabel.Font = Enum.Font.Gotham; ExecutorLabel.TextSize = 10; ExecutorLabel.TextXAlignment = Enum.TextXAlignment.Left; ExecutorLabel.Parent = UserCard
+local StatusLabel = Instance.new("TextLabel"); StatusLabel.Size = UDim2.new(0.6,0,0,15); StatusLabel.Position = UDim2.new(0,65,0,48); StatusLabel.BackgroundTransparency = 1; StatusLabel.Text = "● 监听运行中"; StatusLabel.TextColor3 = Color3.fromRGB(40,205,65); StatusLabel.Font = Enum.Font.Gotham; StatusLabel.TextSize = 10; StatusLabel.TextXAlignment = Enum.TextXAlignment.Left; StatusLabel.Parent = UserCard
+
+
+-- ======================== 分类选项卡与功能面板 ========================
+local TabContainer = Instance.new("Frame"); TabContainer.Size = UDim2.new(1, -20, 0, 32); TabContainer.Position = UDim2.new(0, 10, 0, 128); TabContainer.BackgroundColor3 = Color3.fromRGB(25, 27, 33); TabContainer.ZIndex = 10; TabContainer.Parent = MainFrame
+local tabCorner = Instance.new("UICorner"); tabCorner.CornerRadius = UDim.new(0, 6); tabCorner.Parent = TabContainer
+
+local BasicTab = Instance.new("TextButton"); BasicTab.Size = UDim2.new(0.5, -2, 1, 0); BasicTab.Position = UDim2.new(0, 0, 0, 0); BasicTab.BackgroundColor3 = Color3.fromRGB(60, 120, 255); BasicTab.Text = "基础功能"; BasicTab.TextColor3 = Color3.new(1,1,1); BasicTab.Font = Enum.Font.GothamBold; BasicTab.TextSize = 11; BasicTab.Parent = TabContainer
+local bCorner = Instance.new("UICorner"); bCorner.CornerRadius = UDim.new(0, 6); bCorner.Parent = BasicTab
+
+local MainTab = Instance.new("TextButton"); MainTab.Size = UDim2.new(0.5, -2, 1, 0); MainTab.Position = UDim2.new(0.5, 0, 0, 0); MainTab.BackgroundColor3 = Color3.fromRGB(35, 38, 48); MainTab.Text = "主要功能"; MainTab.TextColor3 = Color3.fromRGB(180, 180, 190); MainTab.Font = Enum.Font.GothamBold; MainTab.TextSize = 11; MainTab.Parent = TabContainer
+local mCorner = Instance.new("UICorner"); mCorner.CornerRadius = UDim.new(0, 6); mCorner.Parent = MainTab
+
+local ContentContainer = Instance.new("Frame"); ContentContainer.Size = UDim2.new(1, -20, 1, -170); ContentContainer.Position = UDim2.new(0, 10, 0, 166); ContentContainer.BackgroundTransparency = 1; ContentContainer.ClipsDescendants = true; ContentContainer.Parent = MainFrame
+
+local BasicPanel = Instance.new("Frame"); BasicPanel.Size = UDim2.new(1, 0, 1, 0); BasicPanel.BackgroundTransparency = 1; BasicPanel.Parent = ContentContainer
+local MainPanel = Instance.new("Frame"); MainPanel.Size = UDim2.new(1, 0, 1, 0); MainPanel.BackgroundTransparency = 1; MainPanel.Visible = false; MainPanel.Parent = ContentContainer
+
+BasicTab.MouseButton1Click:Connect(function()
+	BasicPanel.Visible = true; MainPanel.Visible = false
+	BasicTab.BackgroundColor3 = Color3.fromRGB(60, 120, 255); BasicTab.TextColor3 = Color3.new(1,1,1)
+	MainTab.BackgroundColor3 = Color3.fromRGB(35, 38, 48); MainTab.TextColor3 = Color3.fromRGB(180,180,190)
+end)
+MainTab.MouseButton1Click:Connect(function()
+	BasicPanel.Visible = false; MainPanel.Visible = true
+	BasicTab.BackgroundColor3 = Color3.fromRGB(35, 38, 48); BasicTab.TextColor3 = Color3.fromRGB(180,180,190)
+	MainTab.BackgroundColor3 = Color3.fromRGB(60, 120, 255); MainTab.TextColor3 = Color3.new(1,1,1)
+end)
+
+-- ======================== 基础功能面板 ========================
+local BasicLayout = Instance.new("UIListLayout"); BasicLayout.Padding = UDim.new(0, 12); BasicLayout.SortOrder = Enum.SortOrder.LayoutOrder; BasicLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center; BasicLayout.Parent = BasicPanel
+
+local function createItem(text, btn)
+	local f = Instance.new("Frame"); f.Size = UDim2.new(1, -20, 0, 34); f.BackgroundTransparency = 1; f.Parent = BasicPanel
+	local t = Instance.new("TextLabel"); t.Size = UDim2.new(0.5,0,1,0); t.BackgroundTransparency = 1; t.Text = text; t.TextColor3 = Color3.fromRGB(220,220,230); t.Font = Enum.Font.GothamBold; t.TextSize = 11; t.TextXAlignment = Enum.TextXAlignment.Left; t.Parent = f
+	if btn then btn.Position = UDim2.new(1, 0, 0.5, 0); btn.AnchorPoint = Vector2.new(1, 0.5); btn.Parent = f end
+	return f
+end
+
+local SwitchFrame = Instance.new("Frame"); SwitchFrame.Size = UDim2.new(1, -20, 0, 34); SwitchFrame.BackgroundTransparency = 1; SwitchFrame.Parent = BasicPanel
+local SwitchLabel = Instance.new("TextLabel"); SwitchLabel.Size = UDim2.new(0.5,0,1,0); SwitchLabel.BackgroundTransparency = 1; SwitchLabel.Text = "选择显示用户"; SwitchLabel.TextColor3 = Color3.fromRGB(220,220,230); SwitchLabel.Font = Enum.Font.GothamBold; SwitchLabel.TextSize = 11; SwitchLabel.TextXAlignment = Enum.TextXAlignment.Left; SwitchLabel.Parent = SwitchFrame
+local DropdownBtn = Instance.new("TextButton"); DropdownBtn.Size = UDim2.new(0, 120, 0, 28); DropdownBtn.Position = UDim2.new(1, 0, 0.5, 0); DropdownBtn.AnchorPoint = Vector2.new(1, 0.5); DropdownBtn.BackgroundColor3 = Color3.fromRGB(45, 50, 65); DropdownBtn.Text = "▼ 匿名用户"; DropdownBtn.TextColor3 = Color3.new(1,1,1); DropdownBtn.Font = Enum.Font.GothamBold; DropdownBtn.TextSize = 10; DropdownBtn.Parent = SwitchFrame
+local ddCorner = Instance.new("UICorner"); ddCorner.CornerRadius = UDim.new(0, 4); ddCorner.Parent = DropdownBtn
+
+local DropdownContainer = Instance.new("Frame"); DropdownContainer.Size = UDim2.new(0, 120, 0, 100); DropdownContainer.BackgroundColor3 = Color3.fromRGB(30, 32, 40); DropdownContainer.Visible = false; DropdownContainer.ClipsDescendants = true; DropdownContainer.ZIndex = 150; DropdownContainer.Parent = ScreenGui
+local ddcCorner = Instance.new("UICorner"); ddcCorner.CornerRadius = UDim.new(0, 4); ddcCorner.Parent = DropdownContainer
+local ddScroller = Instance.new("ScrollingFrame"); ddScroller.Size = UDim2.new(1, -4, 1, -4); ddScroller.Position = UDim2.new(0, 2, 0, 2); ddScroller.BackgroundTransparency = 1; ddScroller.ScrollBarThickness = 4; ddScroller.ClipsDescendants = false; ddScroller.Parent = DropdownContainer
+local ddLayout = Instance.new("UIListLayout"); ddLayout.Padding = UDim.new(0, 2); ddLayout.Parent = ddScroller
+
+local function refreshDropdown()
+	for _, c in ipairs(ddScroller:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			local btn = Instance.new("TextButton"); btn.Size = UDim2.new(1,0,0,22); btn.BackgroundColor3 = Color3.fromRGB(40,42,50); btn.Text = plr.Name; btn.TextColor3 = Color3.fromRGB(220,220,230); btn.Font = Enum.Font.Gotham; btn.TextSize = 10; btn.Parent = ddScroller
+			btn.MouseButton1Click:Connect(function()
+				currentSelectedPlayer = plr
+				NameLabel.Text = "👤 当前用户: "..plr.Name
+				UserAvatar.Image = "rbxthumb://type=Avatar&id="..plr.UserId.."&w=150&h=150"
+				DropdownContainer.Visible = false
+				DropdownBtn.Text = "▼ "..plr.Name
+				dropdownOpen = false
+				notify("已切换至 "..plr.Name)
+			end)
+		end
+	end
+	ddScroller.CanvasSize = UDim2.new(0,0,0, ddLayout.AbsoluteContentSize.Y)
+end
+DropdownBtn.MouseButton1Click:Connect(function()
+	dropdownOpen = not dropdownOpen
+	if dropdownOpen then
+		local absPos = SwitchFrame.AbsolutePosition
+		DropdownContainer.Position = UDim2.new(0, absPos.X + 300, 0, absPos.Y + 36)
+		DropdownContainer.Visible = true; refreshDropdown()
+	else DropdownContainer.Visible = false end
+end)
+
+local TransBtn = Instance.new("TextButton"); TransBtn.Size = UDim2.new(0, 85, 0, 26); TransBtn.BackgroundColor3 = Color3.fromRGB(60,60,80); TransBtn.Text = "☁️ 透明"; TransBtn.TextColor3 = Color3.new(1,1,1); TransBtn.Font = Enum.Font.GothamBold; TransBtn.TextSize = 11
+local trCorner = Instance.new("UICorner"); trCorner.CornerRadius = UDim.new(0, 6); trCorner.Parent = TransBtn
+createItem("切换玻璃质感", TransBtn)
+TransBtn.MouseButton1Click:Connect(function()
+	isTransparent = not isTransparent
+	MainFrame.BackgroundTransparency = isTransparent and 0.3 or 0
+	TitleBar.BackgroundTransparency = isTransparent and 0.4 or 0.1
+	UserCard.BackgroundTransparency = isTransparent and 0.2 or 0
+	notify(isTransparent and "已开启半透明" or "已关闭半透明")
+end)
+
+local AFKBtn = Instance.new("TextButton"); AFKBtn.Size = UDim2.new(0, 80, 0, 26); AFKBtn.BackgroundColor3 = Color3.fromRGB(60,60,80); AFKBtn.Text = "⏳ AFK"; AFKBtn.TextColor3 = Color3.new(1,1,1); AFKBtn.Font = Enum.Font.GothamBold; AFKBtn.TextSize = 11
+local afkCorner = Instance.new("UICorner"); afkCorner.CornerRadius = UDim.new(0, 6); afkCorner.Parent = AFKBtn
+createItem("开启防挂机保护", AFKBtn)
+AFKBtn.MouseButton1Click:Connect(function()
+	isAFKEnabled = not isAFKEnabled
+	if isAFKEnabled then AFKBtn.BackgroundColor3 = Color3.fromRGB(40, 205, 65); notify("AFK防踢已开启")
+		task.spawn(function() while isAFKEnabled do task.wait(60) if isAFKEnabled and (tick() - lastInputTime > 1200) then VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.W, false, game); task.wait(0.1); VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game) end end end)
+	else AFKBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80); notify("AFK防踢已关闭") end
+end)
+UserInputService.InputBegan:Connect(function() if isAFKEnabled then lastInputTime = tick() end end)
+
+local RainbowBtn = Instance.new("TextButton"); RainbowBtn.Size = UDim2.new(0, 100, 0, 26); RainbowBtn.BackgroundColor3 = Color3.fromRGB(60,60,80); RainbowBtn.Text = "🌈 呼吸边框"; RainbowBtn.TextColor3 = Color3.new(1,1,1); RainbowBtn.Font = Enum.Font.GothamBold; RainbowBtn.TextSize = 10
+local rCorner = Instance.new("UICorner"); rCorner.CornerRadius = UDim.new(0, 6); rCorner.Parent = RainbowBtn
+createItem("切换彩虹发光边框", RainbowBtn)
+RainbowBtn.MouseButton1Click:Connect(function()
+	isRainbowStroke = not isRainbowStroke
+	if isRainbowStroke then RainbowBtn.BackgroundColor3 = Color3.fromRGB(40, 205, 65)
+		task.spawn(function() local h=0; while isRainbowStroke do h=(h+0.01)%1; UIStroke.Color=Color3.fromHSV(h,0.5,0.7); task.wait(0.05) end end)
+	else RainbowBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80); UIStroke.Color = Color3.fromRGB(45, 50, 65); end
+end)
+
+
+-- ======================== 主要功能面板 ========================
+local MainLayout = Instance.new("UIListLayout"); MainLayout.SortOrder = Enum.SortOrder.LayoutOrder; MainLayout.Padding = UDim.new(0, 6); MainLayout.Parent = MainPanel
+
+local InfoLayout = Instance.new("Frame"); InfoLayout.Size = UDim2.new(1, 0, 1, 0); InfoLayout.BackgroundTransparency = 1; InfoLayout.Parent = MainPanel
+local LeftC = Instance.new("Frame"); LeftC.Size = UDim2.new(0.38, 0, 1, 0); LeftC.BackgroundTransparency = 1; LeftC.Parent = InfoLayout
+local Divider = Instance.new("Frame"); Divider.Size = UDim2.new(0, 1, 1, 0); Divider.Position = UDim2.new(0.39, 0, 0, 0); Divider.BackgroundColor3 = Color3.fromRGB(45, 50, 65); Divider.Parent = InfoLayout
+local RightC = Instance.new("Frame"); RightC.Size = UDim2.new(0.58, 0, 1, 0); RightC.Position = UDim2.new(0.41, 0, 0, 0); RightC.BackgroundTransparency = 1; RightC.Parent = InfoLayout
+
+local LogLabel = Instance.new("TextLabel"); LogLabel.Size = UDim2.new(1,0,0,24); LogLabel.BackgroundTransparency = 1; LogLabel.Text = "📋 监听日志"; LogLabel.TextColor3 = Color3.fromRGB(200,200,210); LogLabel.Font = Enum.Font.GothamBold; LogLabel.TextSize = 10; LogLabel.TextXAlignment = Enum.TextXAlignment.Left; LogLabel.Parent = LeftC
+local LogScroller = Instance.new("ScrollingFrame"); LogScroller.Size = UDim2.new(1,0,1,-26); LogScroller.Position = UDim2.new(0,0,0,26); LogScroller.CanvasSize = UDim2.new(0,0,0,0); LogScroller.ScrollBarThickness = 6; LogScroller.ScrollBarImageColor3 = Color3.fromRGB(64,169,255); LogScroller.BackgroundTransparency = 1; LogScroller.Parent = LeftC
+local LogLayout = Instance.new("UIListLayout"); LogLayout.Padding = UDim.new(0, 4); LogLayout.Parent = LogScroller
+
+local RightHead = Instance.new("Frame"); RightHead.Size = UDim2.new(1,0,0,26); RightHead.BackgroundTransparency = 1; RightHead.Parent = RightC
+local PlayLabel = Instance.new("TextLabel"); PlayLabel.Size = UDim2.new(0.7,0,1,0); PlayLabel.BackgroundTransparency = 1; PlayLabel.Text = "🎵 已捕获 ID"; PlayLabel.TextColor3 = Color3.fromRGB(200,200,210); PlayLabel.Font = Enum.Font.GothamBold; PlayLabel.TextSize = 11; PlayLabel.TextXAlignment = Enum.TextXAlignment.Left; PlayLabel.Parent = RightHead
+local ClearLogBtn = Instance.new("TextButton"); ClearLogBtn.Size = UDim2.new(0,24,0,24); ClearLogBtn.Position = UDim2.new(1,0,0,0); ClearLogBtn.AnchorPoint = Vector2.new(1,0); ClearLogBtn.BackgroundColor3 = Color3.fromRGB(200,50,50); ClearLogBtn.Text = "🗑️"; ClearLogBtn.TextColor3 = Color3.new(1,1,1); ClearLogBtn.Font = Enum.Font.GothamBold; ClearLogBtn.TextSize = 13; ClearLogBtn.Parent = RightHead
+local cCorner = Instance.new("UICorner"); cCorner.CornerRadius = UDim.new(0,4); cCorner.Parent = ClearLogBtn
+ClearLogBtn.MouseButton1Click:Connect(function()
+	for _,v in ipairs(LogScroller:GetChildren()) do if v:IsA("TextButton") then v:Destroy() end end
+	for _,v in ipairs(PlayScroller:GetChildren()) do if v:IsA("Frame") then v:Destroy() end end
+	playedIdSet = {}; task.wait(); LogScroller.CanvasSize = UDim2.new(0,0,0,0); PlayScroller.CanvasSize = UDim2.new(0,0,0,0); notify("日志已清空")
+end)
+
+local PlayScroller = Instance.new("ScrollingFrame"); PlayScroller.Size = UDim2.new(1,0,1,-28); PlayScroller.Position = UDim2.new(0,0,0,28); PlayScroller.CanvasSize = UDim2.new(0,0,0,0); PlayScroller.ScrollBarThickness = 6; PlayScroller.ScrollBarImageColor3 = Color3.fromRGB(64,169,255); PlayScroller.BackgroundTransparency = 1; PlayScroller.Parent = RightC
+local PlayLayout = Instance.new("UIListLayout"); PlayLayout.Padding = UDim.new(0, 4); PlayLayout.Parent = PlayScroller
+
+
+-- ======================== 主UI拖拽逻辑 ========================
+local isDraggingUI = false
+local uiDragStart, uiFrameOff
+
+TitleBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		isDraggingUI = true
+		uiDragStart = Vector2.new(input.Position.X, input.Position.Y)
+		uiFrameOff = Vector2.new(MainFrame.Position.X.Offset, MainFrame.Position.Y.Offset)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		isDraggingUI = false
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if isDraggingUI and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local dx = input.Position.X - uiDragStart.X
+		local dy = input.Position.Y - uiDragStart.Y
+		MainFrame.Position = UDim2.new(0, uiFrameOff.X + dx, 0, uiFrameOff.Y + dy)
+	end
+end)
+
+
+-- ======================== 核心音频引擎 ========================
+local previewSound = Instance.new("Sound"); previewSound.Volume = 0.45; previewSound.Parent = workspace
+local function addLogEntry(playerObj, musicId)
+	local timeStamp = os.date("%H:%M:%S"); local name = playerObj and playerObj.Name or "未知玩家"
+	local logLabel = Instance.new("TextButton"); logLabel.Size = UDim2.new(1,0,0,22); logLabel.BackgroundColor3 = Color3.fromRGB(25,28,38)
+	logLabel.Text = string.format("[%s] %s ▶ ID:%d", timeStamp, name, musicId); logLabel.TextColor3 = Color3.fromRGB(200,200,210); logLabel.Font = Enum.Font.Gotham; logLabel.TextSize = 10; logLabel.TextXAlignment = Enum.TextXAlignment.Left; logLabel.Parent = LogScroller
+	LogScroller.CanvasSize = UDim2.new(0,0,0,LogLayout.AbsoluteContentSize.Y)
+	if not playedIdSet[musicId] then
+		playedIdSet[musicId] = true
+		local wrapFrame = Instance.new("Frame"); wrapFrame.Size = UDim2.new(1,0,0,32); wrapFrame.BackgroundColor3 = Color3.fromRGB(25,30,40); wrapFrame.Parent = PlayScroller
+		local idText = Instance.new("TextLabel"); idText.Size = UDim2.new(0.60,0,1,0); idText.Position = UDim2.new(0,6,0,0); idText.BackgroundTransparency = 1; idText.Text = tostring(musicId); idText.TextColor3 = Color3.fromRGB(64,169,255); idText.Font = Enum.Font.GothamBold; idText.TextSize = 11; idText.TextXAlignment = Enum.TextXAlignment.Left; idText.Parent = wrapFrame
+		local btnContainer = Instance.new("Frame"); btnContainer.Size = UDim2.new(0.35,0,0.7,0); btnContainer.Position = UDim2.new(0.63,0,0.15,0); btnContainer.BackgroundTransparency = 1; btnContainer.Parent = wrapFrame
+		local playBtn = Instance.new("TextButton"); playBtn.Size = UDim2.new(0.32,0,1,0); playBtn.Position = UDim2.new(0,0,0,0); playBtn.BackgroundColor3 = Color3.fromRGB(64,169,255); playBtn.Text = "试听"; playBtn.TextColor3 = Color3.new(1,1,1); playBtn.Font = Enum.Font.GothamBold; playBtn.TextSize = 9; playBtn.Parent = btnContainer
+		local pauseBtn = Instance.new("TextButton"); pauseBtn.Size = UDim2.new(0.32,0,1,0); pauseBtn.Position = UDim2.new(0.34,0,0,0); pauseBtn.BackgroundColor3 = Color3.fromRGB(255,175,0); pauseBtn.Text = "暂停"; pauseBtn.TextColor3 = Color3.new(1,1,1); pauseBtn.Font = Enum.Font.GothamBold; pauseBtn.TextSize = 9; pauseBtn.Parent = btnContainer
+		local copyBtn = Instance.new("TextButton"); copyBtn.Size = UDim2.new(0.32,0,1,0); copyBtn.Position = UDim2.new(0.68,0,0,0); copyBtn.BackgroundColor3 = Color3.fromRGB(45,50,65); copyBtn.Text = "复制"; copyBtn.TextColor3 = Color3.new(1,1,1); copyBtn.Font = Enum.Font.Gotham; copyBtn.TextSize = 9; copyBtn.Parent = btnContainer
+		PlayScroller.CanvasSize = UDim2.new(0,0,0,PlayLayout.AbsoluteContentSize.Y)
+		playBtn.MouseButton1Click:Connect(function() previewSound:Stop(); previewSound.SoundId = "rbxassetid://"..tostring(musicId); previewSound:Play() end)
+		pauseBtn.MouseButton1Click:Connect(function() previewSound:Pause(); notify("音乐已暂停") end)
+		copyBtn.MouseButton1Click:Connect(function() pcall(function() setclipboard(tostring(musicId)) end); notify("ID已复制") end)
+	end
+end
+
+local function watchPlayer(player)
+	task.wait(0.15)
+	local function watchObj(root, plr)
+		root.DescendantAdded:Connect(function(inst)
+			if inst:IsA("Sound") then
+				local id = tonumber(string.match(inst.SoundId, "rbxassetid://(%d+)"))
+				if id then addLogEntry(plr, id) end
+			end
+		end)
+	end
+	if player.Character then watchObj(player.Character, player) end
+	player.CharacterAdded:Connect(function(c) watchObj(c, player) end)
+	watchObj(player.PlayerGui, player)
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do task.spawn(watchPlayer, plr) end
+Players.PlayerAdded:Connect(watchPlayer)
