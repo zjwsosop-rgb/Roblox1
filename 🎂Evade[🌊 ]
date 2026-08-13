@@ -1,1 +1,1 @@
-https://raw.githubusercontent.com/gumanba/Scripts/main/EvadeEvent
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gumanba/Scripts/main/EvadeEvent"))()
